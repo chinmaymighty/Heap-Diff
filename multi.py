@@ -10,6 +10,7 @@ import requests #needs pip3 install
 import influxdb_client
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+import argparse
 
 # Helper function to find the index of value of some known key from the baseline data query
 def get_index(a):
@@ -33,18 +34,17 @@ def load_baseline(measurement_name):
 	|> range(start: -%s)
 	|> filter(fn: (r) => r._measurement == "%s")
 	|> mean()
-	""" % (sys.argv[4], sys.argv[13], measurement_name)
+	""" % (args.server_name, args.baselineDuration, measurement_name)
 	#Initializing influxDB variables for query
-	token = sys.argv[7]
-	org = sys.argv[5]
-	url = sys.argv[10]
+	token = args.influx_token
+	org = args.influx_org_name
+	url = args.influx_url
 	client = influxdb_client.InfluxDBClient(url = url, token = token, org = org)
 	query_api = client.query_api()
 	tables = query_api.query(query, org = org)
 	print("Printing query results: ")
 	for table in tables:
 		for record in table:
-			# print(record)
 			if record['ClassName'] not in baseline:
 				baseline[record['ClassName']]=[0,0,0,0]
 			baseline[record['ClassName']][get_index(record['_field'])]=record['_value']
@@ -55,7 +55,7 @@ def load_baseline(measurement_name):
 # Worker thread function to execute dominator tree and histogram for the given hprof file
 def Dom_api(heap_filename, all_data, histo_data):
 	print('Running dominator_tree command using MAT api.')
-	os.system('java -Xmx'+ sys.argv[12] + ' -jar '+sys.argv[1]+'/mat/plugins/org.eclipse.equinox.launcher_*.jar -consolelog -application org.eclipse.mat.api.parse '+heap_filename+' -command="dominator_tree -groupBy BY_CLASS" -format=csv -unzip org.eclipse.mat.api:query')
+	os.system('java -Xmx'+ args.maxHeap + ' -jar ' + args.mat_path + '/mat/plugins/org.eclipse.equinox.launcher_*.jar -consolelog -application org.eclipse.mat.api.parse '+heap_filename+' -command="dominator_tree -groupBy BY_CLASS" -format=csv -unzip org.eclipse.mat.api:query')
 	print('dominator_tree command complete')
 	csv_folder = heap_filename[:-6] + '_Query/pages'
 	filenames = glob.glob(csv_folder + '/*.csv')
@@ -71,7 +71,7 @@ def Dom_api(heap_filename, all_data, histo_data):
 				row[4]=float(row[4])*100
 				if(total_retained_heap < 0):
 					total_retained_heap = (int(row[3])/row[4]) * 100
-				if sys.argv[11] != "0" and (row[0].startswith('java') or row[0].startswith('jdk')):
+				if args.excludeSystemClass and (row[0].startswith('java') or row[0].startswith('jdk')):
 					continue
 				all_data.append(row)
 	print("\nLength: ", len(all_data))
@@ -83,7 +83,7 @@ def Dom_api(heap_filename, all_data, histo_data):
 		return
 	# Running system_overview report to get class histrogram with retained heap sizes
 	print("Trying histogram, to check if the retained size is present or not")
-	os.system('java -Xmx' + sys.argv[12] + ' -jar '+sys.argv[1]+'/mat/plugins/org.eclipse.equinox.launcher_*.jar -consolelog -application org.eclipse.mat.api.parse '+heap_filename+' -format=csv -unzip org.eclipse.mat.api:overview')
+	os.system('java -Xmx' + args.maxHeap + ' -jar ' + args.mat_path + '/mat/plugins/org.eclipse.equinox.launcher_*.jar -consolelog -application org.eclipse.mat.api.parse '+heap_filename+' -format=csv -unzip org.eclipse.mat.api:overview')
 	print("Finished overview command!!")
 	csv_folder = heap_filename[:-6] + '_System_Overview/pages'
 	filenames = glob.glob(csv_folder + '/Class_Histogram*.csv')
@@ -92,7 +92,7 @@ def Dom_api(heap_filename, all_data, histo_data):
 			csvr = csv.reader(f)
 			header = next(csvr)
 			for row in csvr:
-				if sys.argv[11] != "0" and (row[0].startswith('java') or row[0].startswith('jdk')):
+				if args.excludeSystemClass and (row[0].startswith('java') or row[0].startswith('jdk')):
 					continue
 				if(len(row) == 5):
 					row[4] = ((100.0 * int(row[3]))/ total_retained_heap)
@@ -108,12 +108,12 @@ def Dom_api(heap_filename, all_data, histo_data):
 def influx_push(all_data, histo_data):
 	print("Starting influx thread to post data")
 	# Setting up basic variables for influxDB
-	token = sys.argv[7]
-	org = sys.argv[5]
-	url = sys.argv[10]
+	token = args.influx_token
+	org = args.influx_org_name
+	url = args.influx_url
 
 	client = influxdb_client.InfluxDBClient(url = url, token = token, org = org)
-	bucket = sys.argv[4]
+	bucket = args.server_name
 	write_api = client.write_api(write_options = SYNCHRONOUS)
 	total_sent = 0
 	for row in all_data:
@@ -121,7 +121,7 @@ def influx_push(all_data, histo_data):
 		total_sent += 1
 		# Don't send data points which have less than 0.005% of retained heap size
 		if(round(float(row[4]), 2) != 0.0):
-			point = (Point(sys.argv[8]).tag("ClassName", row[0]).field("PercentageRetainedHeap", float(row[4])).field("Objects", int(row[1])).field("ShallowHeap", int(row[2])).field("RetainedHeap", int(row[3])))
+			point = (Point(args.dominator_tree_measurement).tag("ClassName", row[0]).field("PercentageRetainedHeap", float(row[4])).field("Objects", int(row[1])).field("ShallowHeap", int(row[2])).field("RetainedHeap", int(row[3])))
 			write_api.write(bucket = bucket, org=org, record = point)
 	print('Sent the dominator_tree data to influx')
 	print('-*-'*60)
@@ -133,7 +133,7 @@ def influx_push(all_data, histo_data):
 	for row in histo_data:
 		print("SENDING POINT: ", row, " INDEX: ", total_sent)
 		total_sent += 1
-		point = (Point(sys.argv[9]).tag("ClassName", row[0]).field("PercentageRetainedHeap", float(row[4])).field("Objects", int(row[1])).field("ShallowHeap", int(row[2])).field("RetainedHeap", int(row[3])))
+		point = (Point(args.histogram_measurement).tag("ClassName", row[0]).field("PercentageRetainedHeap", float(row[4])).field("Objects", int(row[1])).field("ShallowHeap", int(row[2])).field("RetainedHeap", int(row[3])))
 		write_api.write(bucket = bucket, org=org, record = point)
 	print("Finished posting all data")
 
@@ -141,13 +141,29 @@ def influx_push(all_data, histo_data):
 #Class Name,Objects,Shallow Heap,Retained Heap,Percentage,
 # COMMAND: docker run -d --name test2 --mount type=bind,source="$(pwd)",target=/dump b:1 /multi.py (0) /opt (1) /dump/Main.hprof (2) Run with or without baseline, 0 for without, anything else for with baseline (3) <ServerName> (4) <INFLUX org name> (5) <Slack_Incoming_Webhook> (6) <INFLUX token> (7) <Dominator_tree Bucket name> (8) <Histogram Bucket name> (9) <INFLUX URL> (10) Whether to exclude system classes or not (0 or 1) (11) <Maximum heap size for MAT> (12) <How many previous days for baseline retrieval> (13)
 if __name__ == '__main__':
-	if(len(sys.argv)!=14):
-		print("WRONG FORMAT OF ARGUMENTS: ", sys.argv, len(sys.argv))
-		os._exit(-1)
+	parser = argparse.ArgumentParser(description='HeapDump comparison and anomaly detection')
+	parser.add_argument('mat_path', help = 'Path where Eclipse MAT is installed. When run inside docker it is /opt')
+	parser.add_argument('heap_filename', help = 'Heap dump file path')
+	parser.add_argument('server_name', help = 'Server name')
+	parser.add_argument('influx_org_name', help = 'Influx org name')
+	parser.add_argument('slack_incoming_webhook', help = 'Slack incoming webhook')
+	parser.add_argument('influx_token', help = 'InfluxDB token')
+	parser.add_argument('dominator_tree_measurement', help = 'Dominator tree measurement name for influxDB')
+	parser.add_argument('histogram_measurement', help = 'Histogram data measurement name for influxDB')
+	parser.add_argument('influx_url', help = 'InfluxDB URL')
+	parser.add_argument('--getBaseline', help = 'Whether to load baseline data from influx or not', action='store_true')
+	parser.add_argument('--excludeSystemClass', help = 'Whether to exclude system classes or not', action = 'store_true')
+	parser.add_argument('--maxHeap', help = 'Maximum heap size for MAT', default = '4g')
+	parser.add_argument('--baselineDuration', help = 'Duration to get baseline data from influx', default='14d')
+	global args
+	args = parser.parse_args()
+	# if(len(sys.argv)!=14):
+	# 	print("WRONG FORMAT OF ARGUMENTS: ", sys.argv, len(sys.argv))
+	# 	os._exit(-1)
 	print("Arguments: ", sys.argv)
 	t = time.process_time()
 	t1 = time.time()
-	heap_filename = sys.argv[2]
+	heap_filename = args.heap_filename
 	heap_filename.strip()
 	# Check if the heap dump file is in hprof format
 	if(heap_filename[-6:] != '.hprof'):
@@ -162,12 +178,12 @@ if __name__ == '__main__':
 	dom_thread.start()
 	baseline = {}
 	# Don't load baseline if specified by user
-	if(sys.argv[3] != "0"):
-		baseline = load_baseline(sys.argv[8])
+	if(args.getBaseline):
+		baseline = load_baseline(args.dominator_tree_measurement)
 	histo_baseline = {}
 	# Don't load baseline if specified by user
-	if(sys.argv[3] != "0"):
-		histo_baseline = load_baseline(sys.argv[9])
+	if(args.getBaseline):
+		histo_baseline = load_baseline(args.histogram_measurement)
 	# Print tablular output
 	table = PrettyTable(['ClassName', 'Objects', 'Objects(S-B)', 'Shallow Heap', 'Shallow Heap(S-B)', 'Retained Heap', 'Retained Heap(S-B)', 'Percentage', 'Percentage(S-B)'])
 	anomaly_table = PrettyTable(['ClassName', 'RetainedHeap(RH)', 'RH-Diff', '%Diff'])
@@ -185,7 +201,7 @@ if __name__ == '__main__':
 	print("\nThread OVER: ", len(all_data))
 	# If no data is loaded from dominator tree or histogram, don't proceed
 	if(len(all_data) == 0 and len(histo_data) == 0):
-		response = requests.post(sys.argv[6], data='{"text":"Some error occured during parsing of heap dump. Please check logs file. Both DOMINATOR TREE and Histogram are empty"}', headers={'Content-type': 'application/json'})
+		response = requests.post(slack_incoming_webhook, data='{"text":"Some error occured during parsing of heap dump. Please check logs file. Both DOMINATOR TREE and Histogram are empty"}', headers={'Content-type': 'application/json'})
 		os._exit(-1)
 	#INFLUX integration for writing data
 	influx_thread = threading.Thread(target = influx_push, name = 'influx_push_thread', args = (all_data,histo_data,))
@@ -218,12 +234,12 @@ if __name__ == '__main__':
 	print('Total Anomalies in COMPARED DOMINATOR TREE: ', total_anomalies)
 	print(anomaly_table.get_string(sortby='RetainedHeap(RH)', reversesort=True))
 	# Store the incoming web-hook in URL
-	URL = sys.argv[6]
-	slack_data = '{"text": "```\nServer Name: ' + sys.argv[4] + '\nTotal Anomalies in COMPARED DOMINATOR TREE: ' + str(total_anomalies) + '\n' + anomaly_table.get_string(sortby='RetainedHeap(RH)', reversesort=True) + '\n```"}'
+	URL = args.slack_incoming_webhook
+	slack_data = '{"text": "```\nServer Name: ' + args.server_name + '\nTotal Anomalies in COMPARED DOMINATOR TREE: ' + str(total_anomalies) + '\n' + anomaly_table.get_string(sortby='RetainedHeap(RH)', reversesort=True) + '\n```"}'
 	if total_anomalies == 0:
 		print("No Anomalies Found in COMPARED DOMINATOR TREE!!")
 		# If no anomalies, change the text to state no anomalies present
-		slack_data = '{"text": "Server Name: ' + sys.argv[4] + '\n*HOORAY!! NO ANOMALIES FOUND IN COMPARED DOMINATOR TREE*"}'
+		slack_data = '{"text": "Server Name: ' + args.server_name + '\n*HOORAY!! NO ANOMALIES FOUND IN COMPARED DOMINATOR TREE*"}'
 	print(slack_data)
 	response = requests.post(URL, data=slack_data, headers={'Content-type': 'application/json'})
 	if(response.status_code != 200):
@@ -238,11 +254,11 @@ if __name__ == '__main__':
 	print("Histogram data")
 	# Print compared histogram table in logs
 	print(histo_table.get_string(sort_key=itemgetter(8,9), sortby='Percentage', reversesort=True))
-	slack_data = '{"text": "```\nServer Name: ' + sys.argv[4] + '\nTotal Anomalies in Histogram data: ' + str(total_histo_anomalies) + '\n' + histo_anomaly_table.get_string(sortby='RetainedHeap(RH)', reversesort=True) + '\n```"}'
+	slack_data = '{"text": "```\nServer Name: ' + args.server_name + '\nTotal Anomalies in Histogram data: ' + str(total_histo_anomalies) + '\n' + histo_anomaly_table.get_string(sortby='RetainedHeap(RH)', reversesort=True) + '\n```"}'
 	if(total_histo_anomalies == 0):
 		print("NO ANOMALIES FOUND in Histogram data")
 		# If no anomalies, change the text to state no anomalies present
-		slack_data = '{"text": "Server Name: ' + sys.argv[4] + '\n*HOORAY!! NO ANOMALIES FOUND IN Histogram data*"}'
+		slack_data = '{"text": "Server Name: ' +args.server_name + '\n*HOORAY!! NO ANOMALIES FOUND IN Histogram data*"}'
 	response = requests.post(URL, data=slack_data, headers={'Content-type': 'application/json'})
 	if(response.status_code != 200):
 		raise ValueError('Request to slack returned an error %s, the response is:\n%s'% (response.status_code, response.text))
